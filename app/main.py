@@ -9,26 +9,45 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import re
 from datetime import date,datetime, timedelta, timezone,time
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 from decimal import Decimal, ROUND_HALF_UP  
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator, model_validator
 from contextlib import asynccontextmanager
 from pymongo import ASCENDING, DESCENDING, MongoClient
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, PyMongoError
+from fastapi.exceptions import RequestValidationError
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+client = MongoClient(
+    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+    tz_aware=True,                 # aware UTC datetimes, never naive
+    serverSelectionTimeoutMS=5000,
+)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+Status = Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
 
 def ensure_indexes() -> None:
+    # uniqueness is enforced by the database (defects 12 and 17)
+    db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="uniq_emp_code")
+    db.employees.create_index(
+        [("department", ASCENDING), ("emp_code", ASCENDING)], name="dept_emp_code"
+    )
     db.attendance_logs.create_index(
         [("emp_code", ASCENDING), ("date", DESCENDING)], unique=True, name="uniq_emp_date"
+    )
+    db.attendance_logs.create_index(
+        [("date", DESCENDING), ("emp_code", ASCENDING)], name="date_emp"
+    )
+    db.attendance_logs.create_index(
+        [("status", ASCENDING), ("date", DESCENDING), ("emp_code", ASCENDING)],
+        name="status_date_emp",
     )
 
 
@@ -36,6 +55,7 @@ def ensure_indexes() -> None:
 async def lifespan(_app: FastAPI):
     ensure_indexes()
     yield
+
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
@@ -102,23 +122,112 @@ def compute_half_day(work_hours) -> bool:
     """R5: true when the ROUNDED work_hours is below 4.50. Call it after punch-out."""
     return work_hours is not None and work_hours < 4.5                           # R3: 30-minute minimum                           
 
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+
+def dt_to_ms(value: datetime) -> int:
+    """Datetime -> epoch milliseconds (integer arithmetic). Naive values are UTC, as Mongo stores them."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return (value - EPOCH) // timedelta(milliseconds=1)
+
+
+def _ms_if_datetime(value):
+    return dt_to_ms(value) if isinstance(value, datetime) else value
+
+
+def history_out(entries) -> list:
+    """History times (and punch times nested in `changes`) -> epoch milliseconds."""
+    out = []
+    for e in entries or []:
+        changes = {
+            field: {"from": _ms_if_datetime(v.get("from")), "to": _ms_if_datetime(v.get("to"))}
+            for field, v in (e.get("changes") or {}).items()
+        }
+        out.append({"at": dt_to_ms(e["at"]), "by": e.get("by"), "reason": e.get("reason"), "changes": changes})
+    return out
+
+
+def attendance_out(doc: dict) -> dict:
+    """Stored attendance document -> API record: no _id / id, instants as epoch milliseconds."""
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": _ms_if_datetime(doc.get("punch_in")),
+        "punch_out": _ms_if_datetime(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes", 0),
+        "overtime_minutes": doc.get("overtime_minutes", 0),
+        "half_day": doc.get("half_day", False),
+        "history": history_out(doc.get("history")),
+    }
+
+def employee_out(doc: dict) -> dict:
+    """Stored employee document -> API record (no _id; created_at as epoch milliseconds)."""
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc["name"],
+        "email": doc["email"],
+        "department": doc["department"],
+        "shift_start": doc["shift_start"],
+        "shift_end": doc["shift_end"],
+        "joined_on": doc["joined_on"],
+        "created_at": _ms_if_datetime(doc.get("created_at")),
+    }
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_HHMM = r"^([01][0-9]|2[0-3]):[0-5][0-9]$"   # [0-9], not \d: \d also matches non-ASCII digits
+
+
+def parse_date_str(value: str) -> date:
+    """Strict YYYY-MM-DD (date.fromisoformat alone also accepts e.g. '20260706')."""
+    if not _DATE_RE.fullmatch(value):
+        raise ValueError("date must be formatted YYYY-MM-DD")
+    return date.fromisoformat(value)   # raises ValueError for impossible dates (2026-02-30)
+
+def query_date(name: str, value: Optional[str]) -> Optional[date]:
+    """Validate a date query parameter; a bad value becomes FastAPI's standard 422."""
+    if value is None:
+        return None
+    try:
+        return parse_date_str(value)
+    except ValueError as exc:
+        raise RequestValidationError(
+            [{"type": "value_error", "loc": ("query", name), "msg": str(exc), "input": value}]
+        )
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
+    emp_code: str = Field(pattern=r"^EMP[0-9]{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field(default="09:30", pattern=_HHMM)
+    shift_end: str = Field(default="18:30", pattern=_HHMM)
     joined_on: str
+
+    @field_validator("joined_on")
+    @classmethod
+    def _valid_joined_on(cls, v: str) -> str:
+        parse_date_str(v)
+        return v
+
+    @model_validator(mode="after")
+    def _shift_times_differ(self) -> "EmployeeIn":
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
+
+
+MIN_EPOCH_MS = 100_000_000_000     # below this a value looks like seconds -> 422
+MAX_EPOCH_MS = 4_102_444_800_000   # 2100-01-01T00:00:00Z
+EpochMillis = Annotated[int, Field(strict=True, ge=MIN_EPOCH_MS, le=MAX_EPOCH_MS)]
 
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
+    punched_at: Optional[EpochMillis] = None
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
@@ -127,29 +236,38 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    try:
+        client.admin.command("ping")          # 200 only if MongoDB answers
+    except PyMongoError:
+        raise HTTPException(503, "database unavailable")
     return {"status": "ok"}
 
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
+    now = datetime.now(timezone.utc)
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    # MongoDB keeps milliseconds; truncate so the value we return equals the stored one.
+    doc["created_at"] = now.replace(microsecond=now.microsecond // 1000 * 1000)
+    try:
+        db.employees.insert_one(doc)                 # the unique index decides, not a prior lookup
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+    return employee_out(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None,
+    page: Annotated[int, Query(ge=1, le=1_000_000_000)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,):
     q = {}
     if department:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    skip = (page - 1) * page_size
+    total = db.employees.count_documents(q)          # total honours the filter
+    cursor = db.employees.find(q, {"_id": 0}).sort("emp_code", ASCENDING).skip(skip).limit(page_size)
+    return {"items": [employee_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
 @app.post("/attendance/punch-in", status_code=201)
@@ -157,7 +275,7 @@ def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if emp is None:
         raise HTTPException(404, "employee not found")
-    ts = datetime.fromtimestamp(body.punched_at // 1000, tz=timezone.utc) if body.punched_at else datetime.now(timezone.utc).replace(microsecond=0)
+    ts = datetime.fromtimestamp(body.punched_at // 1000, tz=timezone.utc) if body.punched_at is not None else datetime.now(timezone.utc).replace(microsecond=0)
     d = attendance_date(ts, emp["shift_start"], emp["shift_end"]).isoformat()
 
     doc = {
@@ -173,13 +291,12 @@ def punch_in(body: PunchInIn):
         "history": [],
     }
     try:
-        res = db.attendance_logs.insert_one(doc)      # the unique index decides, not a prior lookup
+        db.attendance_logs.insert_one(doc)            # the unique index decides, not a prior lookup
     except DuplicateKeyError:
         raise HTTPException(409, "already punched in for this date")
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    return attendance_out(doc)
+   
+    
 
 
 @app.get("/attendance")
@@ -187,28 +304,36 @@ def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    status: Optional[Status] = None,
+    page: Annotated[int, Query(ge=1, le=1_000_000_000)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
 ):
+    d_from = query_date("date_from", date_from)
+    d_to = query_date("date_to", date_to)
+    if d_from and d_to and d_from > d_to:
+        raise RequestValidationError(
+            [{"type": "value_error", "loc": ("query", "date_from"),
+              "msg": "date_from must not be after date_to", "input": date_from}]
+        )
     q = {}
     if emp_code:
         q["emp_code"] = emp_code
-    if date_from or date_to:
+    if d_from or d_to:
         q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
+        if d_from:
+            q["date"]["$gte"] = d_from.isoformat()
+        if d_to:
+            q["date"]["$lte"] = d_to.isoformat()
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q)
+        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])   # total order -> stable pages
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {"items": [attendance_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
